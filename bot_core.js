@@ -105,21 +105,62 @@ function helpText() {
 // ---------------------------------------------------------------------------
 // בחירת המוצר להשוואה
 // ---------------------------------------------------------------------------
-var NEAR_SCORE = 0.08;   // מוצרים שהציון שלהם קרוב לזה של הראשון נחשבים "מתאימים באותה מידה"
+// המוצר המרכזי לכל שורה הוא התוצאה הראשונה של החיפוש. ברשת שאין בה את אותו ברקוד
+// (ביצים, לחם ומותגים פרטיים מקבלים ברקוד אחר בכל רשת) מחפשים מוצר דומה. תחליף חייב:
+//   - להתאים לחיפוש (ציון של לפחות CONFIDENT_SCORE)
+//   - להכיל את סוג המוצר (המילה הראשונה בשם המרכזי) באחת משלוש המילים הראשונות שלו
+//     ("תבנית 12 ביצים" כן, "שמפו ביצים לשיער ..." לא)
+//   - להיות במחיר דומה (פי 1.4 לכל כיוון), כדי שמארז חיסכון או מוצר אחר
+//     ("אטריות ביצים" ב-7 ש"ח מול ביצים ב-14) לא ייחשבו תחליף
+// ומביניהם: עדיפות למוצר עם אותם מספרים בשם (12 ביצים, 750 גרם, 3%), ואז לציון הגבוה.
+var PRICE_RATIO = 1.4;
+var CANDIDATES = 60;           // כמה תוצאות חיפוש לבדוק כשמחפשים תחליפים
 
-function chainCount(r) { return Object.keys(r.prices).length; }
+function firstWord(name) { return tokenize(name)[0] || ""; }
+
+function hasTypeWord(name, word) {
+  return tokenize(name).slice(0, 3).indexOf(word) >= 0;
+}
+
+function numberTokens(name) {
+  return tokenize(name).filter(function (t) { return /^\d/.test(t); });
+}
+
+function medianPrice(prices) {
+  var v = Object.keys(prices).map(function (c) { return prices[c]; }).sort(function (a, b) { return a - b; });
+  return v[v.length >> 1];
+}
 
 /**
- * מבין התוצאות שמתאימות כמעט כמו הראשונה, בוחר את זו שנמכרת בהכי הרבה רשתות,
- * כדי שההשוואה תהיה של אותו מוצר בדיוק בכל רשת. מחזיר את הרשימה בסדר החדש.
+ * מחזיר dict: רשת -> {price, name, same}. same=false כשזה מוצר דומה ולא אותו ברקוד.
+ * רשת שאין בה שום דבר דומה לא מופיעה.
  */
-function preferComparable(results) {
-  if (!results.length) return results;
-  var top = results[0].score;
-  var near = results.filter(function (r) { return r.score >= top - NEAR_SCORE; });
-  var rest = results.filter(function (r) { return r.score < top - NEAR_SCORE; });
-  near.sort(function (a, b) { return (chainCount(b) - chainCount(a)) || (b.score - a.score); });
-  return near.concat(rest);
+function priceByChain(ref, results, chains) {
+  var out = {};
+  var refNums = numberTokens(ref.name);
+  var refPrice = medianPrice(ref.prices);
+  var refWord = firstWord(ref.name);
+  chains.forEach(function (c) {
+    if (ref.prices[c] !== undefined) {
+      out[c] = { price: ref.prices[c], name: ref.name, same: true };
+      return;
+    }
+    var best = null, bestKey = null;
+    results.forEach(function (r) {
+      var p = r.prices[c];
+      if (p === undefined || r.score < CONFIDENT_SCORE || !hasTypeWord(r.name, refWord)) return;
+      if (p > refPrice * PRICE_RATIO || p < refPrice / PRICE_RATIO) return;
+      var nums = numberTokens(r.name);
+      var shared = refNums.filter(function (n) { return nums.indexOf(n) >= 0; }).length;
+      var key = [shared, r.score, -Math.abs(p - refPrice)];
+      if (!bestKey || key[0] > bestKey[0] || (key[0] === bestKey[0] &&
+          (key[1] > bestKey[1] + 0.001 || (Math.abs(key[1] - bestKey[1]) <= 0.001 && key[2] > bestKey[2])))) {
+        best = r; bestKey = key;
+      }
+    });
+    if (best) out[c] = { price: best.prices[c], name: best.name, same: false };
+  });
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -141,7 +182,7 @@ function handleMessage(text, data, index) {
 }
 
 function productReply(query, data, index) {
-  var results = preferComparable(search(index, query, 8)).slice(0, 4);
+  var results = search(index, query, CANDIDATES);
   var lines = [];
   if (!results.length) {
     lines.push('לא מצאתי "' + query + '".');
@@ -160,11 +201,18 @@ function productReply(query, data, index) {
     return { kind: "product", found: "partial", query: query, matched: [], notFound: [query], lines: lines };
   }
 
+  var byChain = priceByChain(top, results, Object.keys(data.chains));
+  var used = {};
   lines.push(top.name);
-  sortedPrices(top.prices).forEach(function (p, i) {
-    lines.push("   " + (i + 1) + ". " + chainName(p.chain) + ": " + money(p.price));
-  });
-  var others = results.slice(1, 4).filter(function (r) { return r.score >= RELATED_SCORE; });
+  Object.keys(byChain).sort(function (a, b) { return byChain[a].price - byChain[b].price; })
+    .forEach(function (c, i) {
+      var p = byChain[c];
+      used[p.name] = true;
+      lines.push("   " + (i + 1) + ". " + chainName(c) + ": " + money(p.price) +
+                 (p.same ? "" : " (מוצר דומה: " + p.name + ")"));
+    });
+  var others = results.slice(1).filter(function (r) { return r.score >= RELATED_SCORE && !used[r.name]; })
+                      .slice(0, 3);
   if (others.length) {
     lines.push("");
     lines.push("אולי חיפשתם:");
@@ -174,24 +222,29 @@ function productReply(query, data, index) {
   }
   lines.push("");
   lines.push(footer(data));
-  return { kind: "product", found: "yes", query: query, cheapest: sortedPrices(top.prices)[0].chain,
+  var cheapest = Object.keys(byChain).sort(function (a, b) { return byChain[a].price - byChain[b].price; })[0];
+  return { kind: "product", found: "yes", query: query, cheapest: cheapest,
            matched: [top.name], notFound: [],
            lines: lines };
 }
 
 function basketReply(req, data, index) {
   var chains = Object.keys(data.chains);
-  var totals = {}, missing = {};
-  chains.forEach(function (c) { totals[c] = 0; missing[c] = 0; });
+  var totals = {}, missing = {}, similar = {};
+  chains.forEach(function (c) { totals[c] = 0; missing[c] = 0; similar[c] = 0; });
 
   var rows = [], notFound = [];
   req.lines.forEach(function (ln) {
-    var r = preferComparable(search(index, ln.text, 8))[0];
+    var results = search(index, ln.text, CANDIDATES);
+    var r = results[0];
     if (!r || r.score < CONFIDENT_SCORE) { notFound.push(ln.text); return; }
-    rows.push({ query: ln.text, item: r, qty: ln.qty });
+    var byChain = priceByChain(r, results, chains);
+    rows.push({ query: ln.text, item: r, qty: ln.qty, byChain: byChain });
     chains.forEach(function (c) {
-      if (r.prices[c] === undefined) missing[c]++;
-      else totals[c] += r.prices[c] * ln.qty;
+      var p = byChain[c];
+      if (!p) { missing[c]++; return; }
+      totals[c] += p.price * ln.qty;
+      if (!p.same) similar[c]++;
     });
   });
 
@@ -206,17 +259,24 @@ function basketReply(req, data, index) {
     .sort(function (a, b) { return (a.missing - b.missing) || (a.total - b.total); });
 
   lines.push("הסל שלכם (" + rows.length + " מוצרים):");
+  var anySimilar = false;
   ranking.forEach(function (r, i) {
-    var note = r.missing ? " (חסרים " + r.missing + " מוצרים)" : (i === 0 && chains.length > 1 ? " (הכי זול)" : "");
-    lines.push("   " + chainName(r.chain) + ": " + money(r.total) + note);
+    var notes = [];
+    if (i === 0 && !r.missing && chains.length > 1) notes.push("הכי זול");
+    if (r.missing) notes.push("חסרים " + r.missing + " מוצרים");
+    if (similar[r.chain]) { notes.push(similar[r.chain] + " מוצרים דומים*"); anySimilar = true; }
+    lines.push("   " + chainName(r.chain) + ": " + money(r.total) + (notes.length ? " (" + notes.join(", ") + ")" : ""));
   });
+  if (anySimilar) {
+    lines.push("   * ברשת שאין בה את אותו מוצר בדיוק, חושב המוצר הדומה ביותר שלה.");
+  }
 
   lines.push("");
   lines.push("פירוט (מה מצאתי לכל שורה):");
   rows.forEach(function (row) {
-    var best = sortedPrices(row.item.prices)[0];
+    var prices = Object.keys(row.byChain).map(function (c) { return row.byChain[c].price; });
     lines.push("   - " + row.item.name + (row.qty > 1 ? " x" + row.qty : "") +
-               " - " + money(best.price * row.qty));
+               " - מ-" + money(Math.min.apply(null, prices) * row.qty));
   });
 
   if (notFound.length) {
@@ -253,6 +313,7 @@ function toHtml(lines) {
 if (typeof module !== "undefined") {
   // ב-Node: search מגיע מ-search.js. ב-Apps Script כל הקבצים חולקים את אותו מרחב שמות.
   global.search = require("./search.js").search;
+  global.tokenize = require("./search.js").tokenize;
   module.exports = { handleMessage: handleMessage, parseRequest: parseRequest,
                      cleanEmailBody: cleanEmailBody };
 }
