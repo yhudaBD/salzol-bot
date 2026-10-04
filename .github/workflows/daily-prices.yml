@@ -1,0 +1,60 @@
+# עדכון מחירים יומי: מוריד קבצי מחירים, בונה prices.json ומפרסם ב-GitHub Pages.
+# הבוט ב-Apps Script קורא את הקובץ מ: https://<user>.github.io/<repo>/prices.json
+name: daily-prices
+
+on:
+  schedule:
+    - cron: "30 4 * * *"      # כל יום ב-04:30 UTC (07:30 בישראל בשעון קיץ). הרשתות מפרסמות מחירים מלאים בלילה
+  workflow_dispatch:           # הרצה ידנית מלשונית Actions
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: הורדת מחירים ובניית prices.json
+        run: python fetch_prices.py --build
+        env:
+          PYTHONIOENCODING: utf-8
+
+      - name: בדיקת שפיות (לא מפרסמים קובץ ריק או קטן מדי)
+        run: |
+          python - <<'EOF'
+          import json, sys
+          d = json.load(open("docs/prices.json", encoding="utf-8"))
+          n = len(d["items"])
+          print("מוצרים:", n, "עדכון:", d["updated"], "סניפים:", d["chains"])
+          if n < 2000:
+              sys.exit("מעט מדי מוצרים - לא מפרסמים, הבוט ימשיך עם הקובץ של אתמול")
+          EOF
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

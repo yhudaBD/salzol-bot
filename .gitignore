@@ -1,0 +1,12 @@
+# נתונים שנוצרים בהרצה (נבנים מחדש כל יום ב-GitHub Actions)
+raw/
+raw_demo/
+demo_prices.json
+docs/prices.json
+stores_*.json
+stores_filter.json
+__pycache__/
+
+# מסמכים פרטיים שנשארים רק במחשב
+product-spec.md
+הוראות התקנה.html
