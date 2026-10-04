@@ -27,8 +27,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      # אם רשת אחת נכשלת, ממשיכים עם השאר (בדיקת השפיות למטה מונעת פרסום של קובץ חסר).
       - name: הורדת מחירים ובניית prices.json
-        run: python fetch_prices.py --build
+        run: python fetch_prices.py --build || echo "::warning::חלק מהרשתות נכשלו בהורדה"
         env:
           PYTHONIOENCODING: utf-8
 
@@ -41,6 +42,8 @@ jobs:
           print("מוצרים:", n, "עדכון:", d["updated"], "סניפים:", d["chains"])
           if n < 2000:
               sys.exit("מעט מדי מוצרים - לא מפרסמים, הבוט ימשיך עם הקובץ של אתמול")
+          if len(d["chains"]) < 3:
+              sys.exit("פחות מ-3 רשתות - לא מפרסמים, הבוט ימשיך עם הקובץ של אתמול")
           EOF
 
       - uses: actions/configure-pages@v5

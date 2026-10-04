@@ -1,7 +1,7 @@
 /**
  * gmail_bot.js  -  שלב 3: סלזול בוט במייל (רץ רק ב-Google Apps Script)
  *
- * בפרויקט Apps Script צריכים להיות 3 קבצים: search, bot_core, gmail_bot.
+ * בפרויקט Apps Script צריכים להיות 4 קבצים: search, bot_core, usage_log, gmail_bot.
  * הוראות התקנה: SETUP.md
  *
  * מה קורה בכל הרצה (כל 5 דקות):
@@ -25,15 +25,19 @@ var IGNORE_SENDERS = /(mailer-daemon|postmaster|no-?reply|noreply|notifications?
 // ---------------------------------------------------------------------------
 function setup() {
   ScriptApp.getProjectTriggers().forEach(function (t) {
-    if (t.getHandlerFunction() === "processInbox") ScriptApp.deleteTrigger(t);
+    var fn = t.getHandlerFunction();
+    if (fn === "processInbox" || fn === "updateSummary") ScriptApp.deleteTrigger(t);
   });
   ScriptApp.newTrigger("processInbox").timeBased().everyMinutes(CONFIG.TRIGGER_MINUTES).create();
+  ScriptApp.newTrigger("updateSummary").timeBased().everyDays(1).atHour(2).create();  // סיכום היומן כל לילה
   getLabel_("salzol/done");
   getLabel_("salzol/error");
   var props = PropertiesService.getScriptProperties();
   if (!props.getProperty("HASH_SALT")) props.setProperty("HASH_SALT", Utilities.getUuid());
+  var log = getLogSpreadsheet_();
   Logger.log("ההתקנה הסתיימה. הבוט יבדוק את התיבה כל %s דקות.", CONFIG.TRIGGER_MINUTES);
   Logger.log("מקור המחירים: %s", describePricesSource_());
+  Logger.log("יומן השימוש: %s", log.getUrl());
 }
 
 // בדיקה ידנית בלי מייל: משנים את הטקסט ומריצים מהעורך
@@ -92,25 +96,22 @@ function handleEmail_(msg, data, index) {
   var started = Date.now();
   var userId = hashSender_(from);
 
-  if (!allowRequest_(userId)) {
-    msg.reply("הגעתם למגבלה של " + CONFIG.DAILY_LIMIT_PER_SENDER +
-              " בקשות ביום. אפשר לנסות שוב מחר. תודה! " + BOT_NAME);
-    return;
-  }
-
   // טקסט הבקשה: גוף המייל, ואם הוא ריק - הנושא
   var text = cleanEmailBody(msg.getPlainBody());
   if (!text) text = String(msg.getSubject() || "").replace(/^(re|fwd?|תשובה)\s*:\s*/i, "").trim();
 
-  var reply = handleMessage(text, data, index);
-  msg.reply(reply.text, { htmlBody: reply.html, name: BOT_NAME });
+  var reply;
+  if (!allowRequest_(userId)) {
+    reply = { kind: "limit" };
+    msg.reply("הגעתם למגבלה של " + CONFIG.DAILY_LIMIT_PER_SENDER +
+              " בקשות ביום. אפשר לנסות שוב מחר. תודה! " + BOT_NAME);
+  } else {
+    reply = handleMessage(text, data, index);
+    msg.reply(reply.text, { htmlBody: reply.html, name: BOT_NAME });
+  }
 
-  // יומן שימוש (שלב 4). כרגע רק ב-Logger, ובשלב 4 יעבור ל-Google Sheets.
-  Logger.log(JSON.stringify({
-    user: userId, kind: reply.kind, found: reply.found, query: text.slice(0, 200),
-    items: reply.items || 1, cheapest: reply.cheapest || "", version: data.updated,
-    ms: Date.now() - started
-  }));
+  logRequest({ user: userId, channel: "מייל", reply: reply, query: text,
+               version: data.updated, ms: Date.now() - started });
 }
 
 // ---------------------------------------------------------------------------
@@ -188,7 +189,7 @@ function getLabel_(name) {
   return GmailApp.getUserLabelByName(name) || GmailApp.createLabel(name);
 }
 
-// שגיאות: כרגע ב-Logger, ובשלב 4 גם לגיליון "שגיאות"
+// שגיאות: לגיליון "שגיאות" ביומן (usage_log)
 function logError_(type, details) {
-  Logger.log("ERROR " + type + ": " + details);
+  logError(type, details, "");
 }

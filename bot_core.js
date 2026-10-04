@@ -11,7 +11,8 @@
 
 var BOT_NAME = "סלזול בוט";
 var CHAIN_NAMES = { rami_levy: "רמי לוי", shufersal: "שופרסל", yochananof: "יוחננוף",
-                    osher_ad: "אושר עד" };
+                    osher_ad: "אושר עד", yesh_hesed: "יש חסד", victory: "ויקטורי",
+                    kt_market: "KT מרקט" };
 var CONFIDENT_SCORE = 0.85;   // מתחת לזה לא מנחשים, אלא מציעים אפשרויות
 var RELATED_SCORE = 0.8;      // ציון מינימלי ל"אולי חיפשתם"
 var MAX_BASKET_ITEMS = 20;
@@ -102,13 +103,33 @@ function helpText() {
 }
 
 // ---------------------------------------------------------------------------
+// בחירת המוצר להשוואה
+// ---------------------------------------------------------------------------
+var NEAR_SCORE = 0.08;   // מוצרים שהציון שלהם קרוב לזה של הראשון נחשבים "מתאימים באותה מידה"
+
+function chainCount(r) { return Object.keys(r.prices).length; }
+
+/**
+ * מבין התוצאות שמתאימות כמעט כמו הראשונה, בוחר את זו שנמכרת בהכי הרבה רשתות,
+ * כדי שההשוואה תהיה של אותו מוצר בדיוק בכל רשת. מחזיר את הרשימה בסדר החדש.
+ */
+function preferComparable(results) {
+  if (!results.length) return results;
+  var top = results[0].score;
+  var near = results.filter(function (r) { return r.score >= top - NEAR_SCORE; });
+  var rest = results.filter(function (r) { return r.score < top - NEAR_SCORE; });
+  near.sort(function (a, b) { return (chainCount(b) - chainCount(a)) || (b.score - a.score); });
+  return near.concat(rest);
+}
+
+// ---------------------------------------------------------------------------
 // טיפול בהודעה
 // ---------------------------------------------------------------------------
 function handleMessage(text, data, index) {
   var req = parseRequest(text);
   var res;
   if (req.kind === "help") {
-    res = { kind: "help", found: "", lines: [helpText()] };
+    res = { kind: "help", found: "", matched: [], notFound: [], lines: [helpText()] };
   } else if (req.kind === "product") {
     res = productReply(req.lines[0].text, data, index);
   } else {
@@ -120,12 +141,12 @@ function handleMessage(text, data, index) {
 }
 
 function productReply(query, data, index) {
-  var results = search(index, query, 4);
+  var results = preferComparable(search(index, query, 8)).slice(0, 4);
   var lines = [];
   if (!results.length) {
     lines.push('לא מצאתי "' + query + '".');
     lines.push("נסו לכתוב את שם המוצר אחרת, או עם שם היצרן (למשל: חלב תנובה 3%).");
-    return { kind: "product", found: "no", query: query, lines: lines };
+    return { kind: "product", found: "no", query: query, matched: [], notFound: [query], lines: lines };
   }
 
   var top = results[0];
@@ -136,7 +157,7 @@ function productReply(query, data, index) {
     });
     lines.push("");
     lines.push(footer(data));
-    return { kind: "product", found: "partial", query: query, lines: lines };
+    return { kind: "product", found: "partial", query: query, matched: [], notFound: [query], lines: lines };
   }
 
   lines.push(top.name);
@@ -154,6 +175,7 @@ function productReply(query, data, index) {
   lines.push("");
   lines.push(footer(data));
   return { kind: "product", found: "yes", query: query, cheapest: sortedPrices(top.prices)[0].chain,
+           matched: [top.name], notFound: [],
            lines: lines };
 }
 
@@ -164,7 +186,7 @@ function basketReply(req, data, index) {
 
   var rows = [], notFound = [];
   req.lines.forEach(function (ln) {
-    var r = search(index, ln.text, 1)[0];
+    var r = preferComparable(search(index, ln.text, 8))[0];
     if (!r || r.score < CONFIDENT_SCORE) { notFound.push(ln.text); return; }
     rows.push({ query: ln.text, item: r, qty: ln.qty });
     chains.forEach(function (c) {
@@ -176,7 +198,8 @@ function basketReply(req, data, index) {
   var lines = [];
   if (!rows.length) {
     lines.push("לא מצאתי אף מוצר מהרשימה. נסו לכתוב כל מוצר בשורה נפרדת, למשל: חלב תנובה 3%");
-    return { kind: "basket", found: "no", items: req.lines.length, lines: lines };
+    return { kind: "basket", found: "no", items: req.lines.length, matched: [], notFound: notFound,
+             lines: lines };
   }
 
   var ranking = chains.map(function (c) { return { chain: c, total: totals[c], missing: missing[c] }; })
@@ -211,6 +234,7 @@ function basketReply(req, data, index) {
   lines.push("");
   lines.push(footer(data));
   return { kind: "basket", found: notFound.length ? "partial" : "yes", items: req.lines.length,
+           matched: rows.map(function (r) { return r.item.name; }), notFound: notFound,
            cheapest: ranking[0].chain, lines: lines };
 }
 

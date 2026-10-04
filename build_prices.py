@@ -31,6 +31,7 @@ import codecs
 import gzip
 import io
 import json
+import re
 import statistics
 import sys
 import zipfile
@@ -90,6 +91,24 @@ def decode_xml(data):
         return data.decode("cp1255", errors="replace")
 
 
+UNKNOWN_BRANDS = ("לא ידוע", "כללי", "-", "unknown")
+
+
+def clean_name(name):
+    """מסיר תוספות שיווקיות מהשם, כמו "*מבצע*" ביוחננוף, ורווחים כפולים."""
+    name = re.sub(r"\*[^*]{0,12}\*", " ", name)
+    return re.sub(r"\s+", " ", name).strip()
+
+
+def norm_sub_chain(text):
+    """
+    "001" -> "1". תת-רשת 0 נחשבת כמו 1: יוחננוף כותבת 000 בקבצי המחירים
+    ו-001 בקובץ הסניפים, ובשתיהן הכוונה לרשת הראשית.
+    """
+    s = (text or "").strip().lstrip("0")
+    return s or "1"
+
+
 def parse_price_xml(xml_bytes):
     """
     קורא קובץ מחירים אחד (של סניף אחד).
@@ -109,7 +128,7 @@ def parse_price_xml(xml_bytes):
             store_id = (el.text or "").strip().lstrip("0") or "0"
 
         elif tag == "subchainid" and sub_chain is None:
-            sub_chain = (el.text or "").strip().lstrip("0") or "0"
+            sub_chain = norm_sub_chain(el.text)
 
         elif tag in ("item", "product"):
             fields = {local_tag(c.tag): (c.text or "").strip() for c in el}
@@ -129,7 +148,7 @@ def parse_price_xml(xml_bytes):
 
             if (code.isdigit() and len(code) >= MIN_BARCODE_LEN and name
                     and price > 0 and not weighted):
-                items.append({"code": code, "name": name, "brand": brand, "price": price})
+                items.append({"code": code, "name": clean_name(name), "brand": brand, "price": price})
             el.clear()                               # חוסך זיכרון בקבצים גדולים
 
     store_key = "%s-%s" % (sub_chain, store_id) if sub_chain else (store_id or "unknown")
@@ -190,8 +209,16 @@ def collect(raw_dir, stores_filter):
                 stores_per_chain[chain].add(store_id)
                 for it in items:
                     prices[it["code"]][chain][store_id] = it["price"]
-                    if it["code"] not in info:
+                    # אותו ברקוד מופיע בכמה רשתות. שומרים את השם הארוך ביותר
+                    # (רמי לוי קוטעת ל-20 תווים), ויצרן אמיתי במקום "לא ידוע".
+                    cur = info.get(it["code"])
+                    if cur is None:
                         info[it["code"]] = {"n": it["name"], "b": it["brand"]}
+                    else:
+                        if len(it["name"]) > len(cur["n"]):
+                            cur["n"] = it["name"]
+                        if it["brand"] and (not cur["b"] or cur["b"] in UNKNOWN_BRANDS):
+                            cur["b"] = it["brand"]
 
     return prices, info, stores_per_chain
 

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-fetch_prices.py  -  הורדת קבצי מחירים מהפורטל המשותף (url.publishedprices.co.il)
+fetch_prices.py  -  הורדת קבצי מחירים מהרשתות
+
+מקורות: הפורטל המשותף (url.publishedprices.co.il) ואתר המחירים של שופרסל.
 
 מה הסקריפט עושה:
   1. מתחבר לפורטל עם שם המשתמש של הרשת (בלי סיסמה).
@@ -34,14 +36,16 @@ import xml.etree.ElementTree as ET
 import io
 
 from build_prices import (RAW_DIR, STORES_FILTER_FILE, decode_xml, local_tag,
-                          unpack_to_xml_list)
+                          norm_sub_chain, unpack_to_xml_list)
 
 # ---------------------------------------------------------------------------
 # הגדרות שאפשר לשנות
 # ---------------------------------------------------------------------------
 PORTAL = "https://url.publishedprices.co.il"
 
-# רשתות בפורטל המשותף: שם התיקייה ב-raw -> שם המשתמש בפורטל.
+# רשתות: שם התיקייה ב-raw -> הגדרות.
+#   user: שם משתמש בפורטל המשותף. source="shufersal": האתר של שופרסל.
+#   sub_chains: רק תתי-רשת מסוימות (בשופרסל: 6 = יש חסד).
 # כדי להוסיף רשת (שלב 6) מוסיפים כאן שורה.
 #   neighborhood_from: מספר סניף שממנו והלאה הסניף "שכונתי" (המחירים בהם יקרים יותר).
 #   בקובץ הסניפים אין שדה שמבדיל ביניהם, ולכן מזהים לפי מספר הסניף.
@@ -51,6 +55,20 @@ CHAINS = {
     "rami_levy": {"user": "RamiLevi", "neighborhood_from": 700,
                   "neighborhood": ["1-3"],  # 1-3 = רמות, ירושלים
                   "excluded": ["1-203"]},   # 1-203 = אילת
+    "osher_ad": {"user": "osherad"},
+    # יש חסד = תת-רשת 6 של שופרסל (אתר נפרד, בלי התחברות)
+    "yesh_hesed": {"source": "shufersal", "sub_chains": ["6"]},
+    # KT מרקט מפרסמת בשם "משנת יוסף" (KT שיווק), 4 סניפים בבית שמש וחריש
+    "kt_market": {"source": "bina", "prefix": "ktshivuk"},
+    # ויקטורי הוסרה (4.10.2026): laibcatalog עונה רק לכתובות מישראל, ו-GitHub Actions רץ מחו"ל.
+    # להחזרה, אם העדכון יעבור לרוץ מישראל:
+    #   "victory": {"source": "laib", "chain_id": "7290696200003",
+    #               "neighborhood": ["1-16", "1-31", "1-35", "1-57", "1-67", "1-75", "1-80"]},
+    # ביוחננוף אין סניפים "שכונתיים", אבל יש סניפים יקרים יותר (+5%, ואחד העם ת"א +13%).
+    # הם מסווגים כאן כ-neighborhood כדי שלא ייכנסו למחיר הרגיל. נבדק ב-4.10.2026.
+    "yochananof": {"user": "yohananof",
+                   "neighborhood": ["1-8", "1-15", "1-16", "1-18", "1-25", "1-29", "1-33", "1-35",
+                                    "1-41", "1-42", "1-48", "1-53", "1-54", "1-59"]},
 }
 
 # קטגוריות סניפים: regular = רגיל, neighborhood = שכונתי, online = אתר אינטרנט,
@@ -75,7 +93,7 @@ TIMEOUT = 120
 #   pricefull7290058140886-039-202610040514.gz          (סניף בלבד, תאריך+שעה צמודים)
 PRICEFULL_RE = re.compile(
     r"^pricefull(\d+)-(?:(\d+)-)?(\d+)-(\d{8})-?(\d{4,6})\.", re.IGNORECASE)
-STORES_RE = re.compile(r"^stores(\d+)-.*?(\d{8})-?(\d{4,6})\.", re.IGNORECASE)
+STORES_RE = re.compile(r"^stores(\d+)-.*?(\d{8})-?(\d{3,6})\.", re.IGNORECASE)  # שופרסל: שעה בת 3 ספרות
 
 
 def norm_id(s):
@@ -84,11 +102,15 @@ def norm_id(s):
 
 
 # ---------------------------------------------------------------------------
-# חיבור לפורטל
+# מקורות קבצים. לכל מקור אותו ממשק:
+#   login()              - התחברות (או כלום, אם אין צורך)
+#   stores_file()        - (שם, תוכן) של קובץ הסניפים העדכני, או (None, None)
+#   pricefull_files(keys) - dict: מזהה סניף -> שם קובץ PriceFull עדכני
+#                          (keys=None: כל הסניפים שיש להם קובץ)
+#   download(fname)      - תוכן הקובץ
 # ---------------------------------------------------------------------------
-class Portal:
-    def __init__(self, user, insecure=False):
-        self.user = user
+class HttpSource:
+    def __init__(self, insecure=False):
         ctx = ssl.create_default_context()
         if insecure:
             ctx.check_hostname = False
@@ -97,17 +119,26 @@ class Portal:
             urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()),
             urllib.request.HTTPSHandler(context=ctx))
         self.opener.addheaders = [("User-Agent", "Mozilla/5.0 (price-bot)")]
-        self.token = None
 
-    def _open(self, path, data=None):
+    def _open(self, url, data=None):
         body = urllib.parse.urlencode(data).encode() if data is not None else None
         try:
-            return self.opener.open(PORTAL + path, body, timeout=TIMEOUT)
+            return self.opener.open(url, body, timeout=TIMEOUT)
         except urllib.error.URLError as e:
             if isinstance(e.reason, ssl.SSLCertVerificationError):
-                sys.exit("אימות תעודת האבטחה של הפורטל נכשל (%s).\n"
+                sys.exit("אימות תעודת האבטחה נכשל (%s).\n"
                          "אם אתה סומך על הרשת שלך, אפשר להריץ שוב עם --insecure" % e.reason)
             raise
+
+
+class CerberusPortal(HttpSource):
+    """הפורטל המשותף url.publishedprices.co.il (רמי לוי, אושר עד, יוחננוף ועוד)."""
+
+    def __init__(self, user, insecure=False):
+        HttpSource.__init__(self, insecure)
+        self.user = user
+        self.token = None
+        self.files = None
 
     @staticmethod
     def _csrf(html):
@@ -117,8 +148,8 @@ class Portal:
         return m.group(1)
 
     def login(self):
-        html = self._open("/login").read().decode("utf-8", "replace")
-        resp = self._open("/login/user", {
+        html = self._open(PORTAL + "/login").read().decode("utf-8", "replace")
+        resp = self._open(PORTAL + "/login/user", {
             "r": "", "username": self.user, "password": "",
             "Submit": "Sign in", "csrftoken": self._csrf(html)})
         page = resp.read().decode("utf-8", "replace")
@@ -126,15 +157,137 @@ class Portal:
             raise RuntimeError("ההתחברות נכשלה עבור המשתמש '%s'." % self.user)
         self.token = self._csrf(page)       # הדף /file מכיל טוקן חדש לבקשות הבאות
 
-    def list_files(self):
-        resp = self._open("/file/json/dir", {
-            "sEcho": "1", "iColumns": "5", "iDisplayStart": "0",
-            "iDisplayLength": "100000", "cd": "/", "csrftoken": self.token})
-        data = json.loads(resp.read().decode("utf-8"))
-        return [row["fname"] for row in data.get("aaData", [])]
+    def _list(self):
+        if self.files is None:
+            resp = self._open(PORTAL + "/file/json/dir", {
+                "sEcho": "1", "iColumns": "5", "iDisplayStart": "0",
+                "iDisplayLength": "100000", "cd": "/", "csrftoken": self.token})
+            data = json.loads(resp.read().decode("utf-8"))
+            self.files = [row["fname"] for row in data.get("aaData", [])]
+            print("בפורטל %d קבצים" % len(self.files))
+        return self.files
+
+    def stores_file(self):
+        name = latest_stores_file(self._list())
+        return (name, self.download(name)) if name else (None, None)
+
+    def pricefull_files(self, keys):
+        best = latest_pricefull_per_store(self._list())
+        return best if keys is None else {k: v for k, v in best.items() if k in keys}
 
     def download(self, fname):
-        return self._open("/file/d/" + urllib.parse.quote(fname)).read()
+        return self._open(PORTAL + "/file/d/" + urllib.parse.quote(fname)).read()
+
+
+class ShufersalPortal(HttpSource):
+    """prices.shufersal.co.il: בלי התחברות. רשימת קבצים לפי קטגוריה וסניף, הקבצים עצמם ב-Azure."""
+    LIST_URL = "https://prices.shufersal.co.il/FileObject/UpdateCategory?catID=%d&storeId=%s&page=1"
+    CAT_PRICEFULL, CAT_STORES = 2, 5
+
+    def __init__(self, insecure=False):
+        HttpSource.__init__(self, insecure)
+        self.urls = {}                       # שם קובץ -> קישור הורדה (חתום, בתוקף כשעה)
+
+    def login(self):
+        pass
+
+    def _links(self, cat, store_id):
+        html = self._open(self.LIST_URL % (cat, store_id)).read().decode("utf-8", "replace")
+        names = []
+        for url in re.findall(r'href="(https://[^"]+\.blob\.core\.windows\.net/[^"]+)"', html):
+            url = url.replace("&amp;", "&")
+            name = urllib.parse.unquote(url.split("?")[0].rsplit("/", 1)[-1])
+            self.urls[name] = url
+            names.append(name)
+        return names
+
+    def stores_file(self):
+        name = latest_stores_file(self._links(self.CAT_STORES, 0))
+        return (name, self.download(name)) if name else (None, None)
+
+    def pricefull_files(self, keys):
+        if keys is None:
+            raise RuntimeError("בשופרסל צריך רשימת סניפים (אין רשימה של כל הקבצים בבת אחת)")
+        out = {}
+        for key in sorted(keys):
+            best = latest_pricefull_per_store(self._links(self.CAT_PRICEFULL, key.split("-")[-1]))
+            if key in best:
+                out[key] = best[key]
+            time.sleep(DOWNLOAD_PAUSE)
+        return out
+
+    def download(self, fname):
+        return self._open(self.urls[fname]).read()
+
+
+class LaibPortal(HttpSource):
+    """laibcatalog.co.il (ויקטורי, מחסני השוק, ח. כהן). עונה רק לכתובות IP מישראל."""
+    BASE = "https://laibcatalog.co.il/webapi"
+
+    def __init__(self, chain_id, insecure=False):
+        HttpSource.__init__(self, insecure)
+        self.chain_id = chain_id
+        self.files = None
+
+    def login(self):
+        pass
+
+    def _list(self):
+        if self.files is None:
+            data = json.loads(self._open("%s/api/getfiles?edi=%s" % (self.BASE, self.chain_id))
+                              .read().decode("utf-8"))
+            self.files = [row["fileName"] for row in data]
+            print("בפורטל %d קבצים" % len(self.files))
+        return self.files
+
+    def stores_file(self):
+        name = latest_stores_file(self._list())
+        return (name, self.download(name)) if name else (None, None)
+
+    def pricefull_files(self, keys):
+        best = latest_pricefull_per_store(self._list())
+        return best if keys is None else {k: v for k, v in best.items() if k in keys}
+
+    def download(self, fname):
+        return self._open("%s/%s/%s" % (self.BASE, self.chain_id, urllib.parse.quote(fname))).read()
+
+
+class BinaPortal(HttpSource):
+    """{prefix}.binaprojects.com (משנת יוסף/KT, קינג סטור ועוד). בלי התחברות."""
+    FILE_TYPES = {"stores": "1", "pricefull": "4"}
+
+    def __init__(self, prefix, insecure=False):
+        HttpSource.__init__(self, insecure)
+        self.base = "https://%s.binaprojects.com" % prefix
+
+    def login(self):
+        pass
+
+    def _list(self, kind):
+        rows = json.loads(self._open(self.base + "/MainIO_Hok.aspx", {
+            "WStore": "", "WDate": "", "WFileType": self.FILE_TYPES[kind]}).read().decode("utf-8"))
+        return [(r.get("FileNm") or "").strip() for r in rows if r.get("FileNm")]
+
+    def stores_file(self):
+        name = latest_stores_file(self._list("stores"))
+        return (name, self.download(name)) if name else (None, None)
+
+    def pricefull_files(self, keys):
+        best = latest_pricefull_per_store(self._list("pricefull"))
+        return best if keys is None else {k: v for k, v in best.items() if k in keys}
+
+    def download(self, fname):
+        return self._open(self.base + "/Download/" + urllib.parse.quote(fname)).read()
+
+
+def make_source(cfg, insecure):
+    if cfg.get("source") == "shufersal":
+        return ShufersalPortal(insecure)
+    if cfg.get("source") == "laib":
+        return LaibPortal(cfg["chain_id"], insecure)
+    if cfg.get("source") == "bina":
+        return BinaPortal(cfg["prefix"], insecure)
+    return CerberusPortal(cfg["user"], insecure)
 
 
 # ---------------------------------------------------------------------------
@@ -162,10 +315,13 @@ def parse_stores(data, cfg):
         for _event, el in ET.iterparse(io.StringIO(decode_xml(xml_bytes)), events=("end",)):
             tag = local_tag(el.tag)
             if tag == "subchainid":
-                sub_chain = norm_id(el.text)
+                sub_chain = norm_sub_chain(el.text)
             elif tag == "store":
                 f = {local_tag(c.tag): (c.text or "").strip() for c in el}
                 key = "%s-%s" % (sub_chain or "1", norm_id(f.get("storeid")))
+                if cfg.get("sub_chains") and (sub_chain or "1") not in cfg["sub_chains"]:
+                    el.clear()
+                    continue                 # תת-רשת אחרת (למשל שופרסל דיל, כשרוצים רק יש חסד)
                 stores[key] = {"name": f.get("storename", ""),
                                "address": f.get("address", ""),
                                "city": f.get("city", ""),
@@ -188,7 +344,7 @@ def latest_pricefull_per_store(files):
         if not m:
             continue
         _chain_id, sub, store, day, hhmm = m.groups()
-        key = "%s-%s" % (norm_id(sub or "1"), norm_id(store))
+        key = "%s-%s" % (norm_sub_chain(sub), norm_id(store))
         stamp = day + hhmm.ljust(6, "0")
         if key not in best or stamp > best[key][0]:
             best[key] = (stamp, f)
@@ -214,16 +370,14 @@ def write_stores_filter(chain, store_ids):
 # ---------------------------------------------------------------------------
 def fetch_chain(chain, cfg, args):
     print("=== %s ===" % chain)
-    portal = Portal(cfg["user"], insecure=args.insecure)
-    portal.login()
-    files = portal.list_files()
-    print("בפורטל %d קבצים" % len(files))
+    source = make_source(cfg, args.insecure)
+    source.login()
 
     # 1. סניפים
     stores = {}
-    stores_name = latest_stores_file(files)
+    stores_name, stores_data = source.stores_file()
     if stores_name:
-        stores = parse_stores(portal.download(stores_name), cfg)
+        stores = parse_stores(stores_data, cfg)
         Path("stores_%s.json" % chain).write_text(
             json.dumps(stores, ensure_ascii=False, indent=1), encoding="utf-8")
         counts = {c: sum(1 for s in stores.values() if s["category"] == c) for c in CATEGORIES}
@@ -233,34 +387,38 @@ def fetch_chain(chain, cfg, args):
     else:
         print("אזהרה: לא נמצא קובץ סניפים")
 
-    # 2. בחירת קבצי מחירים
-    targets = latest_pricefull_per_store(files)
-    missing = sorted(set(stores) - set(targets))
-    if missing:
-        print("אזהרה: אין קובץ PriceFull ל-%d סניפים: %s" % (len(missing), ", ".join(missing)))
-
-    if args.category == "all":
-        excluded = set(cfg.get("excluded", ()))
-        targets = {k: v for k, v in targets.items() if k not in excluded}
+    # 2. אילו סניפים רוצים
+    if not stores:
+        if args.category != "all" or cfg.get("source") == "shufersal":
+            sys.exit("אין קובץ סניפים, ולכן אי אפשר לבחור סניפים. הרץ עם --category all")
+        wanted = None                                   # כל מה שיש בפורטל
+    elif args.category == "all":
+        wanted = {k for k, s in stores.items() if s["category"] != "excluded"}
     else:
-        if not stores:
-            sys.exit("אין קובץ סניפים, ולכן אי אפשר לסנן לפי קטגוריה. הרץ עם --category all")
-        targets = {k: v for k, v in targets.items()
-                   if stores.get(k, {}).get("category") == args.category}
-        print("קטגוריה %s: %d סניפים" % (args.category, len(targets)))
+        wanted = {k for k, s in stores.items() if s["category"] == args.category}
+        print("קטגוריה %s: %d סניפים" % (args.category, len(wanted)))
 
     if args.city:
-        wanted = {k for k, s in stores.items() if city_matches(s["city"], args.city)}
-        if not wanted:
+        in_city = {k for k, s in stores.items() if city_matches(s["city"], args.city)}
+        if not in_city:
             sys.exit("לא נמצאו סניפים בעיר '%s'." % args.city)
-        targets = {k: v for k, v in targets.items() if k in wanted}
-        write_stores_filter(chain, wanted)
+        wanted = in_city if wanted is None else wanted & in_city
+        write_stores_filter(chain, in_city)
         print("סינון לעיר %s: %d סניפים (נכתב %s)" % (args.city, len(wanted), STORES_FILTER_FILE))
 
+    if args.limit and wanted is not None:
+        wanted = set(sorted(wanted)[:args.limit])
+
+    # 3. קבצי המחירים
+    targets = source.pricefull_files(wanted)
     if args.limit:
         targets = dict(sorted(targets.items())[:args.limit])
+    if wanted is not None:
+        missing = sorted(wanted - set(targets))
+        if missing:
+            print("אזהרה: אין קובץ PriceFull ל-%d סניפים: %s" % (len(missing), ", ".join(missing)))
 
-    # 3. הורדה
+    # 4. הורדה
     out_dir = RAW_DIR / chain
     out_dir.mkdir(parents=True, exist_ok=True)
     for old in out_dir.iterdir():
@@ -271,7 +429,7 @@ def fetch_chain(chain, cfg, args):
     for i, (key, fname) in enumerate(sorted(targets.items()), 1):
         for attempt in (1, 2):
             try:
-                data = portal.download(fname)
+                data = source.download(fname)
                 if data[:1] == b"<" and b"<html" in data[:500].lower():
                     raise RuntimeError("התקבל דף HTML במקום קובץ (פג תוקף ההתחברות?)")
                 (out_dir / fname).write_bytes(data)
@@ -282,7 +440,7 @@ def fetch_chain(chain, cfg, args):
             except Exception as e:
                 if attempt == 1:
                     time.sleep(3)
-                    portal.login()
+                    source.login()
                 else:
                     failed.append(key)
                     print("  [%d/%d] %-8s נכשל: %s" % (i, len(targets), key, e))
@@ -297,6 +455,8 @@ def main():
     ap = argparse.ArgumentParser(description="מוריד קבצי PriceFull מהפורטל המשותף")
     ap.add_argument("--chain", choices=sorted(CHAINS), action="append",
                     help="רשת להורדה (אפשר כמה פעמים). ברירת מחדל: כל הרשתות בטבלה")
+    ap.add_argument("--skip", choices=sorted(CHAINS), action="append",
+                    help="רשת לדלג עליה (למשל victory ב-GitHub Actions, שאין לו גישה מחו\"ל)")
     ap.add_argument("--category", choices=CATEGORIES + ("all",), default="regular",
                     help="איזה סניפים להוריד (ברירת מחדל: regular = רגילים בלבד)")
     ap.add_argument("--city", help="רק סניפים בעיר הזו (שם או קוד למ\"ס)")
@@ -309,8 +469,17 @@ def main():
         print("שים לב: קיים %s מהרצה קודמת, ו-build_prices.py יסנן לפיו." % STORES_FILTER_FILE)
 
     all_ok = True
+    skip = set(args.skip or [])
     for chain in args.chain or sorted(CHAINS):
-        all_ok &= fetch_chain(chain, CHAINS[chain], args)
+        if chain in skip:
+            print("=== %s === דילוג (--skip)" % chain)
+            continue
+        try:
+            all_ok &= fetch_chain(chain, CHAINS[chain], args)
+        except Exception as e:
+            # רשת אחת שנכשלה לא עוצרת את השאר. הקבצים של הרשת מהפעם הקודמת (אם יש) נשארים.
+            print("=== %s === נכשל: %s" % (chain, e))
+            all_ok = False
 
     if args.build:
         import build_prices
