@@ -35,8 +35,8 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 import io
 
-from build_prices import (RAW_DIR, STORES_FILTER_FILE, decode_xml, local_tag,
-                          norm_sub_chain, unpack_to_xml_list)
+from build_prices import (CITY_ALIASES, RAW_DIR, STORES_FILTER_FILE, decode_xml, local_tag,
+                          norm_city, norm_sub_chain, unpack_to_xml_list)
 
 # ---------------------------------------------------------------------------
 # הגדרות שאפשר לשנות
@@ -52,9 +52,11 @@ PORTAL = "https://url.publishedprices.co.il"
 #   neighborhood: סניפים שכונתיים נוספים שהמספר שלהם נמוך מ-neighborhood_from.
 #   excluded: סניפים שלא מורידים בכלל (למשל אילת, שבה אין מע"מ והמחירים לא מייצגים).
 CHAINS = {
+    #   city_overrides: עיר ידנית לסניפים שאי אפשר לזהות את העיר שלהם מהקובץ.
     "rami_levy": {"user": "RamiLevi", "neighborhood_from": 700,
                   "neighborhood": ["1-3"],  # 1-3 = רמות, ירושלים
-                  "excluded": ["1-203"]},   # 1-203 = אילת
+                  "excluded": ["1-203"],    # 1-203 = אילת
+                  "city_overrides": {"1-8": "שער בנימין", "1-23": "גוש עציון"}},
     "osher_ad": {"user": "osherad"},
     # יש חסד = תת-רשת 6 של שופרסל (אתר נפרד, בלי התחברות)
     "yesh_hesed": {"source": "shufersal", "sub_chains": ["6"]},
@@ -68,7 +70,11 @@ CHAINS = {
     # הם מסווגים כאן כ-neighborhood כדי שלא ייכנסו למחיר הרגיל. נבדק ב-4.10.2026.
     "yochananof": {"user": "yohananof",
                    "neighborhood": ["1-8", "1-15", "1-16", "1-18", "1-25", "1-29", "1-33", "1-35",
-                                    "1-41", "1-42", "1-48", "1-53", "1-54", "1-59"]},
+                                    "1-41", "1-42", "1-48", "1-53", "1-54", "1-59"],
+                   # יוחננוף לא ממלאת עיר בקובץ הסניפים. אלה הסניפים שהשם שלהם לא מספיק לזיהוי.
+                   "city_overrides": {"1-4": "קרית עקרון", "1-13": "חיפה",
+                                      "1-27": "תל אביב - יפו", "1-34": "אשקלון",
+                                      "1-46": "מעלה אדומים", "1-146": "מעלה אדומים"}},
 }
 
 # קטגוריות סניפים: regular = רגיל, neighborhood = שכונתי, online = אתר אינטרנט,
@@ -307,6 +313,55 @@ def store_category(store_key, store_type, cfg):
     return "regular"
 
 
+CITIES_FILE = Path(__file__).with_name("cities.json")   # קוד למ"ס -> שם יישוב (מ-data.gov.il)
+_cities = None
+_by_norm = None
+
+
+def city_lookup():
+    """dict: שם מנורמל (כולל כינויים) -> שם רשמי."""
+    global _cities, _by_norm
+    if _by_norm is None:
+        _cities = json.loads(CITIES_FILE.read_text(encoding="utf-8")) if CITIES_FILE.exists() else {}
+        _by_norm = {norm_city(n): n for n in _cities.values()}
+        for alias, official in CITY_ALIASES.items():
+            _by_norm[norm_city(alias)] = official
+    return _by_norm
+
+
+def resolve_city(city_field, name, address, key, cfg):
+    """
+    שם העיר של סניף. לפי הסדר:
+      1. city_overrides בהגדרות הרשת
+      2. קוד למ"ס בשדה City (רוב הרשתות)
+      3. שם עיר בשדה City (חלק מהרשתות כותבות שם)
+      4. שם עיר שמופיע בשם הסניף או בכתובת (יוחננוף לא ממלאת City)
+    מחזיר "" אם לא נמצא.
+    """
+    by_norm = city_lookup()
+    if key in cfg.get("city_overrides", {}):
+        return cfg["city_overrides"][key]
+    field = (city_field or "").strip()
+    if field.isdigit() and field.lstrip("0") in _cities:
+        return _cities[field.lstrip("0")]
+    if field and not field.isdigit() and norm_city(field) in by_norm:
+        return by_norm[norm_city(field)]
+    # קודם בשם הסניף ורק אז בכתובת ("רמלה", כתובת "שדרות ירושלים" -> רמלה).
+    # הארוך קודם: "קרית גת" לפני "גת". מילים נפוצות שהן גם שם יישוב לא נחשבות.
+    for text, stop in ((norm_city(name), NAME_STOPLIST), (norm_city(address), ADDRESS_STOPLIST)):
+        text = " %s " % text
+        for n in sorted(by_norm, key=len, reverse=True):
+            if len(n) >= 3 and n not in stop and (" %s " % n) in text:
+                return by_norm[n]
+    return ""
+
+
+# שמות יישובים שהם גם מילים רגילות ("אזור התעשיה", "יגאל אלון", "רחוב", "שדרות ירושלים").
+# בשם הסניף "שדרות" כן מתכוון לעיר ("יש חסד שדרות"), ובכתובת כמעט אף פעם לא.
+NAME_STOPLIST = {"אזור", "מרכז", "רחוב"}
+ADDRESS_STOPLIST = NAME_STOPLIST | {"אלון", "שדרות", "צומת", "נוף", "גן", "שער", "שדות"}
+
+
 def parse_stores(data, cfg):
     """מחזיר dict: מזהה סניף ("תת-רשת-סניף") -> {name, address, city, category}."""
     stores = {}
@@ -325,6 +380,8 @@ def parse_stores(data, cfg):
                 stores[key] = {"name": f.get("storename", ""),
                                "address": f.get("address", ""),
                                "city": f.get("city", ""),
+                               "city_name": resolve_city(f.get("city"), f.get("storename"),
+                                                         f.get("address"), key, cfg),
                                "category": store_category(key, f.get("storetype", ""), cfg)}
                 el.clear()
     return stores

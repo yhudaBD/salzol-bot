@@ -93,6 +93,29 @@ def decode_xml(data):
 
 UNKNOWN_BRANDS = ("לא ידוע", "כללי", "-", "unknown")
 
+# כינויים לערים: איך אנשים (וסניפים) כותבים -> השם הרשמי של הלמ"ס.
+# משמש גם לזיהוי העיר של סניף וגם להבנת העיר שהמשתמש כותב לבוט.
+CITY_ALIASES = {
+    "תל אביב": "תל אביב - יפו", "תא": "תל אביב - יפו", "ת א": "תל אביב - יפו",
+    "תל אביב יפו": "תל אביב - יפו", "יפו": "תל אביב - יפו",
+    "פת": "פתח תקווה", "פ ת": "פתח תקווה", "פתח תקוה": "פתח תקווה",
+    "בב": "בני ברק", "ב ב": "בני ברק",
+    "ים": "ירושלים", "י ם": "ירושלים",
+    "ראשלצ": "ראשון לציון", "ראשון": "ראשון לציון",
+    "מודיעין": "מודיעין-מכבים-רעות", "מודיעין מכבים רעות": "מודיעין-מכבים-רעות",
+    "קרית ספר": "מודיעין עילית",
+    "ביתר": "ביתר עילית",
+    "עקרון": "קרית עקרון",
+    "נוף הגליל": "נוף הגליל", "נצרת עילית": "נוף הגליל",
+}
+
+
+def norm_city(s):
+    """נרמול שם עיר להשוואה: בלי גרשיים ומקפים, "קריית" = "קרית", רווח אחד."""
+    s = re.sub(r"[\"'`׳״\-–()]", " ", s or "")
+    s = s.replace("יי", "י")
+    return " ".join(s.split())
+
 
 def clean_name(name):
     """מסיר תוספות שיווקיות מהשם, כמו "*מבצע*" ביוחננוף, ורווחים כפולים."""
@@ -262,6 +285,26 @@ def build_output(prices, info, stores_per_chain, max_items, min_coverage):
     }
 
 
+def build_cities(stores_per_chain):
+    """
+    איזה רשתות יש בכל עיר, מתוך stores_<רשת>.json (נכתב ע"י fetch_prices.py).
+    מחזיר {עיר: {רשת: "r" או "n"}}: r = יש סניף רגיל (המחיר שבקובץ), n = רק סניף
+    שכונתי/יקר יותר (המחיר שם שונה ועדיין לא נכלל). רק רשתות שיש להן מחירים בקובץ.
+    """
+    cities = defaultdict(dict)
+    for chain in stores_per_chain:
+        path = Path("stores_%s.json" % chain)
+        if not path.exists():
+            continue
+        for store in json.loads(path.read_text(encoding="utf-8")).values():
+            city, cat = store.get("city_name"), store.get("category")
+            if not city or cat not in ("regular", "neighborhood"):
+                continue
+            if cat == "regular" or cities[city].get(chain) != "r":
+                cities[city][chain] = "r" if cat == "regular" else "n"
+    return {c: dict(sorted(v.items())) for c, v in sorted(cities.items())}
+
+
 def print_spread(prices, kept_codes):
     """
     כמה המחירים שונים בין סניפים של אותה רשת (רק למוצרים שנשמרו).
@@ -374,6 +417,10 @@ def main():
 
     prices, info, stores_per_chain = collect(raw_dir, stores_filter)
     result = build_output(prices, info, stores_per_chain, args.max_items, args.min_coverage)
+    if not args.demo:
+        result["cities"] = build_cities(stores_per_chain)
+        result["city_aliases"] = CITY_ALIASES
+        print("ערים עם סניפים: %d" % len(result["cities"]))
 
     out_file.parent.mkdir(parents=True, exist_ok=True)
     out_file.write_text(

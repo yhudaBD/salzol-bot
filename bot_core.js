@@ -97,9 +97,93 @@ function helpText() {
     "   חלב, ביצים L, לחם אחיד, שמן קנולה",
     "   כמות: ביצים L x2",
     "",
+    "העיר שלכם: כתבו פעם אחת, למשל:",
+    "   עיר: בית שמש",
+    "   ומאז אשווה רק בין הרשתות שיש להן סניף בעיר.",
+    "",
     "המחירים מגיעים מקבצי המחירים הרשמיים שהרשתות מפרסמות לפי חוק.",
     "לצורך שיפור השירות נאסף מידע סטטיסטי על החיפושים, בלי שמירת כתובת המייל."
   ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// עיר
+// ---------------------------------------------------------------------------
+// prices.json מכיל cities: {עיר: {רשת: "r"|"n"}} (r = סניף רגיל, n = רק סניף שכונתי/יקר)
+// ו-city_aliases: {כינוי: שם רשמי}. הנרמול זהה ל-norm_city ב-build_prices.py.
+var MIN_CITY_CHAINS = 2;     // פחות מזה בעיר -> משווים בין כל הרשתות
+var ALL_COUNTRY = "כל הארץ";
+
+function normCity(s) {
+  s = String(s || "").replace(/["'`׳״\-–()]/g, " ").replace(/יי/g, "י");
+  return s.replace(/\s+/g, " ").trim();
+}
+
+/** מחזיר את השם הרשמי של העיר, או null אם לא זוהתה. */
+function resolveUserCity(text, data) {
+  var lookup = {};
+  Object.keys(data.cities || {}).forEach(function (c) { lookup[normCity(c)] = c; });
+  var aliases = data.city_aliases || {};
+  Object.keys(aliases).forEach(function (a) { lookup[normCity(a)] = aliases[a]; });
+  var n = normCity(text);
+  if (lookup[n]) return lookup[n];
+  if (n.charAt(0) === "ב" && lookup[n.slice(1)]) return lookup[n.slice(1)];   // "בבית שמש"
+  return null;
+}
+
+/** "עיר: בית שמש", "אני גר בבני ברק", "עיר כל הארץ". מחזיר את טקסט העיר או null. */
+function parseCityCommand(line) {
+  // אחרי המילה חייב לבוא רווח, נקודתיים או סוף השורה, כדי ש"גרעיני חמניות" לא ייחשב פקודה
+  var m = String(line || "").trim().match(/^(?:עיר|העיר שלי|אני גר|אני גרה|גר|גרה)(?:\s*[:\-]\s*|\s+|$)(.*)$/);
+  return m ? m[1].trim() : null;
+}
+
+/**
+ * אילו רשתות להשוות למשתמש מהעיר הזו.
+ * מחזיר {chains, city, note}: note מוסבר למשתמש (או "" אם אין מה להסביר).
+ */
+function chainsForCity(data, city) {
+  var all = Object.keys(data.chains);
+  if (!city || city === ALL_COUNTRY) return { chains: all, city: "", note: "" };
+  var inCity = (data.cities || {})[city] || {};
+  var regular = Object.keys(inCity).filter(function (c) { return inCity[c] === "r"; });
+  var neighborhood = Object.keys(inCity).filter(function (c) { return inCity[c] === "n"; });
+  var notes = [];
+  if (neighborhood.length) {
+    notes.push("ב" + city + " יש גם סניף שכונתי של " + neighborhood.map(chainName).join(", ") +
+               ". המחירים שם שונים ועדיין לא נכללים.");
+  }
+  if (regular.length < MIN_CITY_CHAINS) {
+    notes.unshift(regular.length ?
+      "ב" + city + " יש רק " + chainName(regular[0]) + ", ולכן מוצגות כל הרשתות." :
+      "לא מצאתי סניפים של הרשתות שלנו ב" + city + ", ולכן מוצגות כל הרשתות.");
+    return { chains: all, city: city, note: notes.join(" ") };
+  }
+  return { chains: regular, city: city, note: notes.join(" ") };
+}
+
+function cityReply(cityText, data) {
+  if (!cityText) {
+    return { kind: "city", found: "", lines: ["באיזו עיר אתם גרים? כתבו למשל: עיר: בית שמש"] };
+  }
+  if (normCity(cityText) === normCity(ALL_COUNTRY)) {
+    return { kind: "city", found: "yes", setCity: "",
+             lines: ["מעכשיו אשווה בין כל הרשתות בכל הארץ."] };
+  }
+  var city = resolveUserCity(cityText, data);
+  if (!city) {
+    return { kind: "city", found: "no",
+             lines: ['לא זיהיתי את העיר "' + cityText + '". נסו לכתוב את השם המלא, למשל: עיר: בני ברק'] };
+  }
+  var sel = chainsForCity(data, city);
+  var lines = ["שמרתי: " + city + "."];
+  if (sel.chains.length < Object.keys(data.chains).length) {
+    lines.push("מעכשיו אשווה בין הרשתות שיש להן סניף בעיר: " + sel.chains.map(chainName).join(", ") + ".");
+  }
+  if (sel.note) lines.push(sel.note);
+  lines.push("");
+  lines.push("אפשר לשלוח עכשיו מוצר או רשימת קניות. כדי לשנות עיר, כתבו שוב: עיר: <שם העיר>");
+  return { kind: "city", found: "yes", setCity: city, lines: lines };
 }
 
 // ---------------------------------------------------------------------------
@@ -166,22 +250,62 @@ function priceByChain(ref, results, chains) {
 // ---------------------------------------------------------------------------
 // טיפול בהודעה
 // ---------------------------------------------------------------------------
-function handleMessage(text, data, index) {
+/**
+ * userCity: העיר השמורה של המשתמש ("" או undefined = כל הארץ).
+ * אם ההודעה קובעת עיר, התשובה כוללת setCity (שם העיר, או "" לכל הארץ), והמתקשר שומר אותה.
+ * עיר אפשר לקבוע בשורה הראשונה ולהמשיך באותה הודעה עם רשימת קניות.
+ */
+function handleMessage(text, data, index, userCity) {
+  var lines = String(text || "").trim().split("\n");
+  var cityText = parseCityCommand(lines[0]);
+  var cityRes = null;
+  if (cityText !== null) {
+    cityRes = cityReply(cityText, data);
+    if (cityRes.setCity !== undefined) userCity = cityRes.setCity;
+    text = lines.slice(1).join("\n").trim();
+    if (!text) return finish_(cityRes);
+  }
+
+  var sel = chainsForCity(data, userCity);
   var req = parseRequest(text);
   var res;
   if (req.kind === "help") {
     res = { kind: "help", found: "", matched: [], notFound: [], lines: [helpText()] };
   } else if (req.kind === "product") {
-    res = productReply(req.lines[0].text, data, index);
+    res = productReply(req.lines[0].text, data, index, sel);
   } else {
-    res = basketReply(req, data, index);
+    res = basketReply(req, data, index, sel);
   }
+  if (cityRes) {                               // עיר + רשימה באותה הודעה
+    res.lines = cityRes.lines.slice(0, -2).concat([""], res.lines);
+    res.setCity = cityRes.setCity;
+  }
+  res.city = sel.city;
+  return finish_(res);
+}
+
+function finish_(res) {
+  res.matched = res.matched || [];
+  res.notFound = res.notFound || [];
   res.text = res.lines.join("\n");
   res.html = toHtml(res.lines);
   return res;
 }
 
-function productReply(query, data, index) {
+/** שורות הסיום: תאריך, איזה רשתות הושוו, וטיפ לבחירת עיר. */
+function footerLines(data, sel) {
+  var out = [];
+  if (sel.note) out.push(sel.note);
+  if (sel.city && sel.chains.length < Object.keys(data.chains).length) {
+    out.push("השוואה בין הרשתות ב" + sel.city + ". לשינוי: עיר: <שם העיר>");
+  } else if (!sel.city) {
+    out.push("טיפ: כתבו \"עיר: <שם העיר>\" כדי להשוות רק בין הרשתות שיש בעיר שלכם.");
+  }
+  out.push(footer(data));
+  return out;
+}
+
+function productReply(query, data, index, sel) {
   var results = search(index, query, CANDIDATES);
   var lines = [];
   if (!results.length) {
@@ -197,11 +321,11 @@ function productReply(query, data, index) {
       lines.push("   " + (i + 1) + ". " + r.name + " - " + money(sortedPrices(r.prices)[0].price));
     });
     lines.push("");
-    lines.push(footer(data));
+    lines.push.apply(lines, footerLines(data, sel));
     return { kind: "product", found: "partial", query: query, matched: [], notFound: [query], lines: lines };
   }
 
-  var byChain = priceByChain(top, results, Object.keys(data.chains));
+  var byChain = priceByChain(top, results, sel.chains);
   var used = {};
   lines.push(top.name);
   Object.keys(byChain).sort(function (a, b) { return byChain[a].price - byChain[b].price; })
@@ -221,15 +345,15 @@ function productReply(query, data, index) {
     });
   }
   lines.push("");
-  lines.push(footer(data));
+  lines.push.apply(lines, footerLines(data, sel));
   var cheapest = Object.keys(byChain).sort(function (a, b) { return byChain[a].price - byChain[b].price; })[0];
   return { kind: "product", found: "yes", query: query, cheapest: cheapest,
            matched: [top.name], notFound: [],
            lines: lines };
 }
 
-function basketReply(req, data, index) {
-  var chains = Object.keys(data.chains);
+function basketReply(req, data, index, sel) {
+  var chains = sel.chains;
   var totals = {}, missing = {}, similar = {};
   chains.forEach(function (c) { totals[c] = 0; missing[c] = 0; similar[c] = 0; });
 
@@ -287,12 +411,8 @@ function basketReply(req, data, index) {
     lines.push("");
     lines.push("נבדקו רק " + MAX_BASKET_ITEMS + " המוצרים הראשונים.");
   }
-  if (chains.length === 1) {
-    lines.push("");
-    lines.push("כרגע יש מחירים רק מ" + chainName(chains[0]) + ". רשתות נוספות יתווספו בקרוב.");
-  }
   lines.push("");
-  lines.push(footer(data));
+  lines.push.apply(lines, footerLines(data, sel));
   return { kind: "basket", found: notFound.length ? "partial" : "yes", items: req.lines.length,
            matched: rows.map(function (r) { return r.item.name; }), notFound: notFound,
            cheapest: ranking[0].chain, lines: lines };

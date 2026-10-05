@@ -101,16 +101,21 @@ function handleEmail_(msg, data, index) {
   if (!text) text = String(msg.getSubject() || "").replace(/^(re|fwd?|תשובה)\s*:\s*/i, "").trim();
 
   var reply;
+  var city = getUserCity_(userId);
   if (!allowRequest_(userId)) {
     reply = { kind: "limit" };
     msg.reply("הגעתם למגבלה של " + CONFIG.DAILY_LIMIT_PER_SENDER +
               " בקשות ביום. אפשר לנסות שוב מחר. תודה! " + BOT_NAME);
   } else {
-    reply = handleMessage(text, data, index);
+    reply = handleMessage(text, data, index, city);
+    if (reply.setCity !== undefined) {
+      setUserCity_(userId, reply.setCity);
+      city = reply.setCity;
+    }
     msg.reply(reply.text, { htmlBody: reply.html, name: BOT_NAME });
   }
 
-  logRequest({ user: userId, channel: "מייל", reply: reply, query: text,
+  logRequest({ user: userId, channel: "מייל", city: city, reply: reply, query: text,
                version: data.updated, ms: Date.now() - started });
 }
 
@@ -183,6 +188,17 @@ function allowRequest_(userId) {
   var count = parseInt(props.getProperty(key) || "0", 10) + 1;
   props.setProperty(key, String(count));
   return count <= CONFIG.DAILY_LIMIT_PER_SENDER;
+}
+
+// העיר של כל משתמש נשמרת לפי המזהה המוצפן, לא לפי הכתובת. "" = כל הארץ.
+function getUserCity_(userId) {
+  return PropertiesService.getScriptProperties().getProperty("CITY_" + userId) || "";
+}
+
+function setUserCity_(userId, city) {
+  var props = PropertiesService.getScriptProperties();
+  if (city) props.setProperty("CITY_" + userId, city);
+  else props.deleteProperty("CITY_" + userId);
 }
 
 function getLabel_(name) {

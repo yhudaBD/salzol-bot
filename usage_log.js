@@ -24,7 +24,8 @@ var REQUEST_COLUMNS = [
 ];
 var ERROR_COLUMNS = ["תאריך ושעה", "סוג שגיאה", "פירוט", "רשת"];
 
-var KIND_NAMES = { product: "מוצר בודד", basket: "סל", help: "עזרה", limit: "חריגה ממגבלה" };
+var KIND_NAMES = { product: "מוצר בודד", basket: "סל", help: "עזרה", limit: "חריגה ממגבלה",
+                   city: "בחירת עיר" };
 var FOUND_NAMES = { yes: "כן", no: "לא", partial: "חלקי" };
 
 // ---------------------------------------------------------------------------
