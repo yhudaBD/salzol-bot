@@ -13,7 +13,7 @@ var BOT_NAME = "סלזול בוט";
 var CHAIN_NAMES = { rami_levy: "רמי לוי", shufersal: "שופרסל", yochananof: "יוחננוף",
                     osher_ad: "אושר עד", yesh_hesed: "יש חסד", victory: "ויקטורי",
                     kt_market: "KT מרקט" };
-var CONFIDENT_SCORE = 0.85;   // מתחת לזה לא מנחשים, אלא מציעים אפשרויות
+var CONFIDENT_SCORE = 0.8;    // מתחת לזה לא מנחשים, אלא מציעים אפשרויות
 var RELATED_SCORE = 0.8;      // ציון מינימלי ל"אולי חיפשתם"
 var MAX_BASKET_ITEMS = 20;
 
@@ -206,6 +206,25 @@ function hasTypeWord(name, word) {
   return tokenize(name).slice(0, 3).indexOf(word) >= 0;
 }
 
+var TIE_SCORE = 0.03;          // הפרש ציון שנחשב "שוויון" בבחירת המוצר המרכזי
+var TIE_PRICE_RATIO = 1.5;
+
+/**
+ * המוצר המרכזי לשורה: התוצאה הראשונה, אלא אם יש מוצר כמעט שווה בציון שנמכר ביותר רשתות
+ * ולא יקר ממנה ביותר מפי 1.5 ("פסטה אסם" -> ספגטי אסם שבכל הרשתות, ולא "פסטה גן חיות";
+ * אבל "במבה" לא תהפוך למארז ב-16.90).
+ */
+function pickReference(results) {
+  var top = results[0], best = top;
+  var topPrice = medianPrice(top.prices);
+  results.forEach(function (r) {
+    if (r.score < top.score - TIE_SCORE) return;
+    if (medianPrice(r.prices) > topPrice * TIE_PRICE_RATIO) return;
+    if (Object.keys(r.prices).length > Object.keys(best.prices).length) best = r;
+  });
+  return best;
+}
+
 function numberTokens(name) {
   return tokenize(name).filter(function (t) { return /^\d/.test(t); });
 }
@@ -314,7 +333,7 @@ function productReply(query, data, index, sel) {
     return { kind: "product", found: "no", query: query, matched: [], notFound: [query], lines: lines };
   }
 
-  var top = results[0];
+  var top = results[0].score >= CONFIDENT_SCORE ? pickReference(results) : results[0];
   if (top.score < CONFIDENT_SCORE) {
     lines.push('לא מצאתי בדיוק את "' + query + '". התכוונתם ל:');
     results.slice(0, 3).forEach(function (r, i) {
@@ -354,22 +373,17 @@ function productReply(query, data, index, sel) {
 
 function basketReply(req, data, index, sel) {
   var chains = sel.chains;
-  var totals = {}, missing = {}, similar = {};
-  chains.forEach(function (c) { totals[c] = 0; missing[c] = 0; similar[c] = 0; });
-
-  var rows = [], notFound = [];
+  var rows = [], notFound = [], suggestions = {};
   req.lines.forEach(function (ln) {
     var results = search(index, ln.text, CANDIDATES);
-    var r = results[0];
-    if (!r || r.score < CONFIDENT_SCORE) { notFound.push(ln.text); return; }
+    if (!results.length || results[0].score < CONFIDENT_SCORE) {
+      notFound.push(ln.text);
+      if (results.length && results[0].score >= 0.5) suggestions[ln.text] = results[0].name;
+      return;
+    }
+    var r = pickReference(results);
     var byChain = priceByChain(r, results, chains);
     rows.push({ query: ln.text, item: r, qty: ln.qty, byChain: byChain });
-    chains.forEach(function (c) {
-      var p = byChain[c];
-      if (!p) { missing[c]++; return; }
-      totals[c] += p.price * ln.qty;
-      if (!p.same) similar[c]++;
-    });
   });
 
   var lines = [];
@@ -379,16 +393,35 @@ function basketReply(req, data, index, sel) {
              lines: lines };
   }
 
-  var ranking = chains.map(function (c) { return { chain: c, total: totals[c], missing: missing[c] }; })
-    .sort(function (a, b) { return (a.missing - b.missing) || (a.total - b.total); });
+  // השוואה הוגנת: רק על מוצרים שיש בכל הרשתות שמשווים. מוצר שחסר ברשת לא "מוזיל" אותה.
+  var common = rows.filter(function (row) { return chains.every(function (c) { return row.byChain[c]; }); });
+  var partial = rows.filter(function (row) { return common.indexOf(row) < 0; });
+  var compareRows = common.length ? common : rows;
+  var ranking = chains.map(function (c) {
+    var total = 0, sim = 0, miss = 0;
+    compareRows.forEach(function (row) {
+      var p = row.byChain[c];
+      if (!p) { miss++; return; }
+      total += p.price * row.qty;
+      if (!p.same) sim++;
+    });
+    return { chain: c, total: total, similar: sim, missing: miss };
+  }).sort(function (a, b) { return (a.missing - b.missing) || (a.total - b.total); });
 
-  lines.push("הסל שלכם (" + rows.length + " מוצרים):");
+  if (!partial.length) {
+    lines.push("הסל שלכם (" + rows.length + " מוצרים):");
+  } else if (common.length) {
+    lines.push("הסל שלכם (" + rows.length + " מוצרים). השוואה על " + common.length +
+               " המוצרים שיש בכל הרשתות:");
+  } else {
+    lines.push("הסל שלכם (" + rows.length + " מוצרים). אין מוצר שנמצא בכל הרשתות, ולכן הסכומים חלקיים:");
+  }
   var anySimilar = false;
   ranking.forEach(function (r, i) {
     var notes = [];
     if (i === 0 && !r.missing && chains.length > 1) notes.push("הכי זול");
     if (r.missing) notes.push("חסרים " + r.missing + " מוצרים");
-    if (similar[r.chain]) { notes.push(similar[r.chain] + " מוצרים דומים*"); anySimilar = true; }
+    if (r.similar) { notes.push(r.similar + " מוצרים דומים*"); anySimilar = true; }
     lines.push("   " + chainName(r.chain) + ": " + money(r.total) + (notes.length ? " (" + notes.join(", ") + ")" : ""));
   });
   if (anySimilar) {
@@ -397,15 +430,32 @@ function basketReply(req, data, index, sel) {
 
   lines.push("");
   lines.push("פירוט (מה מצאתי לכל שורה):");
-  rows.forEach(function (row) {
+  compareRows.forEach(function (row) {
     var prices = Object.keys(row.byChain).map(function (c) { return row.byChain[c].price; });
     lines.push("   - " + row.item.name + (row.qty > 1 ? " x" + row.qty : "") +
                " - מ-" + money(Math.min.apply(null, prices) * row.qty));
   });
 
+  if (common.length && partial.length) {
+    lines.push("");
+    lines.push("לא בכל הרשתות (לא נכללו בהשוואה):");
+    partial.forEach(function (row) {
+      var have = chains.filter(function (c) { return row.byChain[c]; })
+                       .sort(function (a, b) { return row.byChain[a].price - row.byChain[b].price; });
+      var lack = chains.filter(function (c) { return !row.byChain[c]; });
+      lines.push("   - " + row.item.name + (row.qty > 1 ? " x" + row.qty : "") + ": " +
+                 have.map(function (c) { return chainName(c) + " " + money(row.byChain[c].price * row.qty); })
+                     .join(", ") +
+                 " (אין: " + lack.map(chainName).join(", ") + ")");
+    });
+  }
+
   if (notFound.length) {
     lines.push("");
-    lines.push("לא מצאתי (לא נכללו בסכום): " + notFound.join(", "));
+    lines.push("לא מצאתי:");
+    notFound.forEach(function (q) {
+      lines.push("   - " + q + (suggestions[q] ? " (אולי: " + suggestions[q] + "?)" : ""));
+    });
   }
   if (req.truncated) {
     lines.push("");

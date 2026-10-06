@@ -49,10 +49,24 @@ var PREFERRED = {
   "ביצים M": ["ביצים", "12", "M"],
   "במבה": ["במבה", "חטיף", "בוטנים", "אסם"],
   "נייר טואלט": ["נייר", "טואלט", "32"],
+  "שמן זית": ["שמן", "זית", "כתית"],
   "אורז": ["אורז", "עגול"],
   "שמן": ["שמן", "קנולה"],
   "לחם": ["לחם", "אחיד", "פרוס", "750"],
   "לחם אחיד": ["לחם", "אחיד", "פרוס", "750"]
+};
+
+// מילים תיאוריות: אם הן לא מופיעות בשם המוצר, לא מורידים עליהן ציון.
+// ("מעדן מילקי" -> המוצרים נקראים "מילקי בטעם שוקולד"). כתובות אחרי נרמול.
+var OPTIONAL_WORDS = {};
+["מעדנ", "משקה", "חטיפ", "לשולחנ", "נשלפ", "נייר", "של", "עמ", "שקית", "אריזה", "בקבוק",
+ "קופסה", "מארז", "רגיל", "רגילה", "טרי", "טריה"].forEach(function (w) { OPTIONAL_WORDS[w] = true; });
+
+// ביטויים שהרשתות כותבות אחרת. מוחלפים בחיפוש לפני הכול (אחרי נרמול).
+var PHRASES = {
+  "סבונ כלימ": "נוזל כלימ",
+  "סבונ לכלימ": "נוזל כלימ",
+  "נוזל לכלימ": "נוזל כלימ"
 };
 
 // יחידות: כל הצורות -> צורה אחת
@@ -134,8 +148,8 @@ function wordScore(q, t, isLastOfTruncated) {
   }
   if (t.length >= 4 && PREFIX_LETTERS.indexOf(t[0]) >= 0) {           // אות שימוש: "בשמנ" -> "שמנ"
     var rest = t.slice(1);
-    if (rest === q) return 0.6;
-    if (q.length >= 3 && rest.indexOf(q) === 0) return 0.5;
+    if (rest === q) return 0.75;                                      // "בגליל" -> "גליל"
+    if (q.length >= 3 && rest.indexOf(q) === 0) return 0.6;
   }
   if (q.length >= 4 && t.length >= 4 && editDistanceAtMost1(q, t)) return 0.7; // שגיאת הקלדה
   if (t.length >= 3 && q.indexOf(t) === 0) return 0.5;
@@ -201,8 +215,12 @@ function bestMatch(q, item) {
 
 function scoreItem(qTokens, item) {
   var total = 0, minWord = 1, firstBonus = 0, numbersOk = true, inOrder = true, lastPos = -1;
+  var counted = 0;
   for (var i = 0; i < qTokens.length; i++) {
     var m = bestMatch(qTokens[i], item);
+    // מילה תיאורית שלא מופיעה בשם ("מעדן מילקי", "גליל ניילון לשולחן") - מתעלמים ממנה
+    if (m.score < 0.5 && OPTIONAL_WORDS[qTokens[i]] && qTokens.length > 1) continue;
+    counted++;
     total += m.score;
     if (m.pos !== lastPos + 1) inOrder = false;
     lastPos = m.pos;
@@ -213,11 +231,12 @@ function scoreItem(qTokens, item) {
     }
     if (i === 0 && m.pos === 0 && m.score >= 0.8) firstBonus = 0.1;
   }
-  var score = total / qTokens.length + firstBonus;
-  if (inOrder && qTokens.length > 1) score += 0.05;   // המילים ברצף ובסדר, מתחילת השם ("קמח לבן ...")
+  if (!counted) return 0;
+  var score = total / counted + firstBonus;
+  if (inOrder && counted > 1) score += 0.05;   // המילים ברצף ובסדר, מתחילת השם ("קמח לבן ...")
   if (minWord < 0.5) score *= 0.5;          // מילה מהחיפוש לא נמצאה בכלל
   if (!numbersOk) score *= 0.6;             // מספר לא תואם (3% מול 1%)
-  score -= 0.01 * Math.max(0, item.tokens.length - qTokens.length);  // עדיפות לשם קצר וממוקד
+  score -= 0.01 * Math.max(0, item.tokens.length - counted);  // עדיפות לשם קצר וממוקד
   return score;
 }
 
@@ -247,7 +266,11 @@ function preferredTokens(qTokens) {
 function search(index, query, n, minScore) {
   n = n || 5;
   minScore = minScore === undefined ? 0.4 : minScore;
-  var qTokens = tokenize(query);
+  var normQuery = normalize(query);
+  for (var ph in PHRASES) {
+    if (PHRASES.hasOwnProperty(ph)) normQuery = (" " + normQuery + " ").replace(" " + ph + " ", " " + PHRASES[ph] + " ").trim();
+  }
+  var qTokens = tokenize(normQuery);
   if (!qTokens.length) return [];
 
   var preferred = preferredTokens(qTokens);
