@@ -54,7 +54,7 @@ var CASES = [
   ["קפה טורקי", ["קפה", "טורקי"]],
   ["קפה", ["קפה"]],
   ["תה ליפטון", ["תה", "ליפטון"]],
-  ["מים מינרליים", ["מים", "מינרליים"]],
+  ["מים מינרליים", ["מים", "מינרל"]],          // הרשתות כותבות גם "מינרלים"
   ["קוקה קולה 1.5", ["קוקה", "קולה", "1.5"]],
   ["קולה זירו", ["קולה", "זירו"]],
   ["מיץ תפוזים", ["מיץ", "תפוזים"]],
@@ -87,7 +87,7 @@ var CASES = [
 ];
 
 function passes(result, want) {
-  var toks = S.tokenize(result.name);
+  var toks = S.tokenize(result.name + " " + (result.brand || ""));   // היצרן נחשב: "קוטג' 9%" [תנובה]
   return want.every(function (w) {
     var nw = S.tokenize(w)[0];
     return toks.some(function (t) { return t.indexOf(nw) === 0; });

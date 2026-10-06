@@ -118,9 +118,27 @@ def norm_city(s):
 
 
 def clean_name(name):
-    """מסיר תוספות שיווקיות מהשם, כמו "*מבצע*" ביוחננוף, ורווחים כפולים."""
+    """
+    מסיר תוספות מהשם: "*מבצע*" ביוחננוף, "יצרן/מותג: תנובה" בשופרסל, ורווחים כפולים.
+    """
     name = re.sub(r"\*[^*]{0,12}\*", " ", name)
-    return re.sub(r"\s+", " ", name).strip()
+    name = re.sub(r",?\s*יצרן/מותג:.*$", "", name)
+    return re.sub(r"\s+", " ", name).strip(" ,")
+
+
+# "24*150גרם", "12X500" - תיאור של קרטון סיטונאי, לא של המוצר שבמחיר
+CASE_PACK_RE = re.compile(r"\d+\s*[*xX×]\s*\d+")
+
+
+def better_name(new, cur):
+    """
+    אותו ברקוד מגיע עם שמות שונים מכל רשת. עדיף שם שאינו תיאור קרטון,
+    ובין שמות שווים - הארוך (רמי לוי קוטעת ל-20 תווים).
+    """
+    new_pack, cur_pack = bool(CASE_PACK_RE.search(new)), bool(CASE_PACK_RE.search(cur))
+    if new_pack != cur_pack:
+        return not new_pack
+    return len(new) > len(cur)
 
 
 def norm_sub_chain(text):
@@ -171,6 +189,10 @@ def parse_price_xml(xml_bytes):
 
             if (code.isdigit() and len(code) >= MIN_BARCODE_LEN and name
                     and price > 0 and not weighted):
+                # שופרסל כותבת את היצרן בתוך השם ("... יצרן/מותג: תנובה"). מעבירים אותו לשדה היצרן.
+                m = re.search(r"יצרן/מותג:\s*(.+)$", name)
+                if m and (not brand or brand in UNKNOWN_BRANDS):
+                    brand = m.group(1).strip()
                 items.append({"code": code, "name": clean_name(name), "brand": brand, "price": price})
             el.clear()                               # חוסך זיכרון בקבצים גדולים
 
@@ -238,7 +260,7 @@ def collect(raw_dir, stores_filter):
                     if cur is None:
                         info[it["code"]] = {"n": it["name"], "b": it["brand"]}
                     else:
-                        if len(it["name"]) > len(cur["n"]):
+                        if better_name(it["name"], cur["n"]):
                             cur["n"] = it["name"]
                         if it["brand"] and (not cur["b"] or cur["b"] in UNKNOWN_BRANDS):
                             cur["b"] = it["brand"]

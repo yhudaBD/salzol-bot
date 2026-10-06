@@ -50,6 +50,7 @@ var PREFERRED = {
   "במבה": ["במבה", "חטיף", "בוטנים", "אסם"],
   "נייר טואלט": ["נייר", "טואלט", "32"],
   "שמן זית": ["שמן", "זית", "כתית"],
+  "קולה זירו": ["קוקה", "קולה", "זירו"],
   "אורז": ["אורז", "עגול"],
   "שמן": ["שמן", "קנולה"],
   "לחם": ["לחם", "אחיד", "פרוס", "750"],
@@ -139,7 +140,7 @@ function editDistanceAtMost1(a, b) {
 // ---------------------------------------------------------------------------
 // ציון התאמה בין מילה בחיפוש למילה בשם המוצר (0 עד 1)
 // ---------------------------------------------------------------------------
-function wordScore(q, t, isLastOfTruncated) {
+function wordScore(q, t, isLastOfTruncated, exact) {
   if (q === t) return 1;
   if (q.length >= 2 && t.indexOf(q) === 0) return 0.85;              // התחלה: "קוט" -> "קוטג"
   if (q.length >= 3 && stem(q) === stem(t)) return 0.8;               // יחיד/רבים
@@ -151,7 +152,7 @@ function wordScore(q, t, isLastOfTruncated) {
     if (rest === q) return 0.75;                                      // "בגליל" -> "גליל"
     if (q.length >= 3 && rest.indexOf(q) === 0) return 0.6;
   }
-  if (q.length >= 4 && t.length >= 4 && editDistanceAtMost1(q, t)) return 0.7; // שגיאת הקלדה
+  if (!exact && q.length >= 4 && t.length >= 4 && editDistanceAtMost1(q, t)) return 0.7; // שגיאת הקלדה
   if (t.length >= 3 && q.indexOf(t) === 0) return 0.5;
   return 0;
 }
@@ -187,7 +188,7 @@ function buildIndex(items) {
   return list;
 }
 
-function bestMatch(q, item) {
+function bestMatch(q, item, exact) {
   var best = 0, pos = -1;
   var toks = item.tokens;
   var alts = SYNONYMS[q] || [];
@@ -197,9 +198,9 @@ function bestMatch(q, item) {
     if (isNumber(q)) {
       s = numberScore(q, toks[i]);
     } else {
-      s = wordScore(q, toks[i], last);
+      s = wordScore(q, toks[i], last, exact);
       for (var a = 0; a < alts.length && s < 1; a++) {
-        s = Math.max(s, 0.95 * wordScore(alts[a], toks[i], last));
+        s = Math.max(s, 0.95 * wordScore(alts[a], toks[i], last, exact));
       }
     }
     if (s > best) { best = s; pos = i; }
@@ -213,11 +214,23 @@ function bestMatch(q, item) {
   return { score: best, pos: pos };
 }
 
-function scoreItem(qTokens, item) {
+// strict: בלי לסלוח על מילה חסרה ובלי שגיאות הקלדה (לברירות מחדל, שם כל אות חשובה:
+// "קוקה" ו"קולה" שונות באות אחת)
+function scoreItem(qTokens, item, strict) {
   var total = 0, minWord = 1, firstBonus = 0, numbersOk = true, inOrder = true, lastPos = -1;
-  var counted = 0;
+  var counted = 0, factor = 1;
+  var matches = qTokens.map(function (q) { return bestMatch(q, item, strict); });
+  // בחיפוש של 3 מילים ומעלה, מילה אחת שחסרה בשם לא מפילה את ההתאמה
+  // ("אבקת כביסה אריאל" -> "אבקת אריאל שושן צחור"), רק מורידה קצת.
+  var missed = [];
+  qTokens.forEach(function (q, i) {
+    if (matches[i].score < 0.5 && !isNumber(q) && !OPTIONAL_WORDS[q]) missed.push(i);
+  });
+  var forgiven = (!strict && qTokens.length >= 3 && missed.length === 1) ? missed[0] : -1;
+  if (forgiven >= 0) factor = 0.9;
   for (var i = 0; i < qTokens.length; i++) {
-    var m = bestMatch(qTokens[i], item);
+    var m = matches[i];
+    if (i === forgiven) continue;
     // מילה תיאורית שלא מופיעה בשם ("מעדן מילקי", "גליל ניילון לשולחן") - מתעלמים ממנה
     if (m.score < 0.5 && OPTIONAL_WORDS[qTokens[i]] && qTokens.length > 1) continue;
     counted++;
@@ -232,7 +245,7 @@ function scoreItem(qTokens, item) {
     if (i === 0 && m.pos === 0 && m.score >= 0.8) firstBonus = 0.1;
   }
   if (!counted) return 0;
-  var score = total / counted + firstBonus;
+  var score = (total / counted + firstBonus) * factor;
   if (inOrder && counted > 1) score += 0.05;   // המילים ברצף ובסדר, מתחילת השם ("קמח לבן ...")
   if (minWord < 0.5) score *= 0.5;          // מילה מהחיפוש לא נמצאה בכלל
   if (!numbersOk) score *= 0.6;             // מספר לא תואם (3% מול 1%)
@@ -256,7 +269,17 @@ function preferredTokens(qTokens) {
       }
     }
   }
-  return preferredCache[qTokens.join(" ")] || null;
+  // התאמה גם כשהחיפוש מתחיל בביטוי ויש אחריו עוד מילים ("קולה זירו 1.5"): הארוך מנצח
+  for (var n = qTokens.length; n > 0; n--) {
+    var pref = preferredCache[qTokens.slice(0, n).join(" ")];
+    if (pref) {
+      var rest = qTokens.slice(n);
+      // המשתמש כתב מספר משלו ("חלב 1%") - המספרים של ברירת המחדל (3%) לא רלוונטיים
+      if (rest.some(isNumber)) pref = pref.filter(function (t) { return !isNumber(t); });
+      return pref.concat(rest);
+    }
+  }
+  return null;
 }
 
 /**
@@ -278,7 +301,7 @@ function search(index, query, n, minScore) {
   for (var i = 0; i < index.length; i++) {
     var s = scoreItem(qTokens, index[i]);
     if (s < minScore) continue;
-    if (preferred) s += 0.2 * scoreItem(preferred, index[i]);
+    if (preferred) s += 0.2 * scoreItem(preferred, index[i], true);
     scored.push({ item: index[i], score: s });
   }
   // בציון זהה (כמעט) - הזול קודם, כי בדרך כלל זו האריזה הבסיסית (1 ליטר לפני 2 ליטר)
